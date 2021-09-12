@@ -52,7 +52,6 @@ class ESPnetASRModel(AbsESPnetModel):
         encoder_rec: AbsEncoder,
         ctc: CTC,
         use_inter_ctc: bool = False,
-        use_stop_sign_ctc: bool = False,
         use_stop_sign_bce: bool = False,
         inter_ctc_weight: float = 0.3,
         ctc_weight: float = 0.5,
@@ -96,8 +95,8 @@ class ESPnetASRModel(AbsESPnetModel):
         if self.use_inter_ctc:
             self.inter_ctc_weight = inter_ctc_weight
             self.project_linear = torch.nn.Linear(self.encoder_con.output_size(), self.adim)
-        self.use_stop_sign_ctc = use_stop_sign_ctc
         self.use_stop_sign_bce = use_stop_sign_bce
+
         if self.use_stop_sign_bce:
             self.stop_sign_loss = StopBCELoss(self.adim, 1, nunits=self.adim)
         if report_cer or report_wer:
@@ -117,6 +116,7 @@ class ESPnetASRModel(AbsESPnetModel):
         :rtype: torch.Tensor
         :return: minimum index
         """
+        
         _, n_left_spkrs, _ = ys_pad.size()
         loss_stack = torch.stack(
             [self.ctc(hs_pad, hs_len, ys_pad[:, i], text_lengths_new[:, i]) for i in range(n_left_spkrs)]
@@ -145,8 +145,6 @@ class ESPnetASRModel(AbsESPnetModel):
         speech_lengths: torch.Tensor,
         text: torch.Tensor,
         text_lengths: torch.Tensor,
-        xvector:  torch.Tensor,
-        xvector_lengths: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
         """Frontend + Encoder + Decoder + Calc loss
 
@@ -156,7 +154,6 @@ class ESPnetASRModel(AbsESPnetModel):
             text: (Batch, Length)
             text_lengths: (Batch,)
         """
-        #pdb.set_trace()
         assert text_lengths.dim() == 1, text_lengths.shape
         # Check that batch_size is unified
         assert (
@@ -174,7 +171,7 @@ class ESPnetASRModel(AbsESPnetModel):
             text_start = 0
             text_end = text_lengths_max
             for j in range(text_lengths_max):
-                if text[i][j] == 4718:
+                if text[i][j] == 2:
                     text_utt_list.append(text[i][text_start:j])
                     text_lengths_new.append(j-text_start)
                     text_start = j+1
@@ -187,7 +184,7 @@ class ESPnetASRModel(AbsESPnetModel):
             text_all.append(text_utt_list)
         text_lengths_new = torch.Tensor(text_lengths_new).int()
         text_lengths_max = int(text_lengths_new.max())
-        text_lengths_new = text_lengths_new.reshape(batch_size,-1)
+        text_lengths_new = text_lengths_new.view(batch_size,-1).to(speech.device)
         num_spkrs = text_lengths_new.size(1)
         text_all_final=[]
 
@@ -197,10 +194,9 @@ class ESPnetASRModel(AbsESPnetModel):
             if pad_num > 0:
                 text_sequence = F.pad(text_sequence, (0,pad_num), "constant", -1)
             text_all_final.append(text_sequence)
-        text_final_label = torch.stack(text_all_final,dim=0)
+        text_final_label = torch.stack(text_all_final,dim=0).to(speech.device)
         # for data-parallel
         #text = text[:, : text_lengths.max()]
-
         # 1. Encoder
         encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
         # encoder_out batchsize * time * dim256
@@ -217,80 +213,55 @@ class ESPnetASRModel(AbsESPnetModel):
         )
 
         loss_att, acc_att, cer_att, wer_att = None, None, None, None
-
+        # encoder_out bc * T * D(256)
         align_ctc_state = encoder_out.new_zeros(encoder_out.size())
         
         for i in range(num_spkrs):
-            #pdb.set_trace()
             condition_out, prev_states = self.encoder_con(
                 encoder_out, align_ctc_state, encoder_out_lens, prev_states
             )
-            #pdb.set_trace()
             # condition_out 8*211*1024
             hs_pad_sd[i], encoder_out_lens,_= self.encoder_rec.forward_hidden(condition_out, encoder_out_lens)
-            #pdb.set_trace()
+             # hs_pad_sd[i] bc * T * D(256)
             loss_ctc[i], min_idx = self.min_ctc_loss_and_perm(
-                hs_pad_sd[i], encoder_out_lens, text_final_label[:, i:], text_lengths_new
+                hs_pad_sd[i], encoder_out_lens, text_final_label[:, i:], text_lengths_new[:, i:]
             )
-            #pdb.set_trace()
             min_idx = min_idx + i
             if i < num_spkrs - 1:
                 text_final_label = self.resort_sequence(text_final_label, min_idx, i)
-            #pdb.set_trace()
             if self.use_inter_ctc:
                 hidden_feature = self.encoder_rec.hidden_feature
                 loss_inter_ctc[i] = self.ctc(hidden_feature, encoder_out_lens, text_final_label[:, i], text_lengths_new[:, i])
                 logging.info("using latent representation as soft conditions.")
                 align_ctc_state = hs_pad_sd[i].detach().data
-            #pdb.set_trace()
             if self.use_stop_sign_bce:
                 stop_label = hs_pad_sd[i].new_zeros((batch_size, 1))
                 if i == num_spkrs - 1:
                     stop_label += 1
                 loss_stop[i] = self.stop_sign_loss(hs_pad_sd[i], encoder_out_lens, stop_label)
-        if self.use_stop_sign_ctc:
-            # blank_ctc_label = ys_pad.new_zeros(ys_pad[:, 0].size())  # (B, Lmax)
-            # blank_ctc_label = blank_ctc_label.masked_fill_(ys_pad[:, 0].lt(0), -1)
-            blank_ctc_label = hs_pad_sd[-1].new_zeros(hs_pad_sd[-1].size())  # (B, Tmax)
-            blank_ctc_label = blank_ctc_label.masked_fill_(
-                hs_mask.view(batch_size, -1, 1).lt(0), -1
-            )
-            loss_ctc.append(self.ctc(hs_pad_sd[-1], hs_len, blank_ctc_label))
-            if torch.isinf(torch.sum(torch.stack(loss_ctc))):
-                print(loss_ctc)
-                exit()
         loss_ctc = torch.stack(loss_ctc, dim=0).mean()  # (num_spkrs, B)
+        loss_stop = torch.stack(loss_stop, dim=0).mean()
         logging.info("ctc loss:" + str(float(loss_ctc)))
-        #pdb.set_trace()
-
         if self.use_inter_ctc:
             loss_inter_ctc = torch.stack(loss_inter_ctc, dim=0).mean()  # (num_spkrs, B)
             logging.info("inter ctc loss:" + str(float(loss_inter_ctc)))
-        # 2b. CTC branch
-        if self.ctc_weight == 0.0:
-            loss_ctc, cer_ctc = None, None
+            loss = self.inter_ctc_weight * loss_inter_ctc + (1 - self.inter_ctc_weight) * loss_ctc
+            loss_att = loss_inter_ctc
         else:
-            loss_ctc, cer_ctc = self._calc_ctc_loss(
-                encoder_out, encoder_out_lens, text, text_lengths
-            )
-
-        if self.ctc_weight == 0.0:
-            loss = loss_att
-        elif self.ctc_weight == 1.0:
             loss = loss_ctc
-        else:
-            loss = self.ctc_weight * loss_ctc + (1 - self.ctc_weight) * loss_att
-
+            loss_att = None
+        if self.use_stop_sign_bce:
+            loss += loss_stop * 100
+            acc_att = loss_stop
         stats = dict(
             loss=loss.detach(),
             loss_att=loss_att.detach() if loss_att is not None else None,
             loss_ctc=loss_ctc.detach() if loss_ctc is not None else None,
-            acc=acc_att,
+            acc=acc_att.detach() if acc_att is not None else None,
             cer=cer_att,
             wer=wer_att,
             cer_ctc=cer_ctc,
         )
-
         # force_gatherable: to-device and to-tensor if scalar for DataParallel
         loss, stats, weight = force_gatherable((loss, stats, batch_size), loss.device)
         return loss, stats, weight
@@ -424,10 +395,22 @@ class StopBCELoss(torch.nn.Module):
         :param torch.Tensor ys: the labels (B, 1)
         """
         xs_pack = torch.nn.utils.rnn.pack_padded_sequence(
-            xs_pad, xs_len, batch_first=True
+            xs_pad, xs_len.cpu(), batch_first=True
         )
         _, (h_n, _) = self.lstmlayers(xs_pack)  # (B, dim)
-
         linear_out = self.dropout(self.output(h_n[-1]))  # (B, 1)
         linear_out = torch.sigmoid(linear_out)
         return self.loss(linear_out, ys)
+    def get_stop_sign(self, xs_pad, xs_len):
+        """
+        :param torch.Tensor xs_pad: input sequence (B, Tmax, dim)
+        :param list xs_len: the lengths of xs (B)
+        :param torch.Tensor ys: the labels (B, 1)
+        """
+        xs_pack = torch.nn.utils.rnn.pack_padded_sequence(
+            xs_pad, xs_len.cpu(), batch_first=True
+        )
+        _, (h_n, _) = self.lstmlayers(xs_pack)  # (B, dim)
+        linear_out = self.dropout(self.output(h_n[-1]))  # (B, 1)
+        linear_out = torch.sigmoid(linear_out)
+        return linear_out
